@@ -65,7 +65,8 @@ static const SafePt SAFE[] = {
     {540,18},{545,25},{550,34},{555,44},{560,54},{570,83},{575,104},{581,127}
 };
 #define NSAFE ((int)(sizeof SAFE / sizeof SAFE[0]))
-#define RMS_CAP 15.0
+#define RMS_CAP 15.0     /* 带内持续音上限（带外按实测表放行到满幅） */
+#define RMS_CAP_FREE 90.0 /* 带外无位移风险的持续音上限：peak 127 的 RMS */
 #define SLEW_MIN 40.0   /* 允许的每样本最大跳变（厂商素材实测 ≤10） */
 
 static int level_of(int mag)
@@ -242,6 +243,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     }
 
     /* 逐块扫描并施加带平滑的增益 */
+    unsigned char *inb = calloc(n / HOP + 2, 1);   /* 每 HOP 块是否命中共振带 */
     if (n >= 512) {
         size_t pos = 0;
         double wf0 = 0;
@@ -253,7 +255,8 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
             double wf = 0;
             /* 尾部不足一块时沿用上一块增益：原来给 1.0，等于让最后 ~20ms 裸奔 */
             double g = (len >= 512) ? band_scan(pcm + pos, len, level, &wf) : prevg;
-            if (g < 1.0) { changed = 1; if (g < ming) { ming = g; worst_f = wf; } }
+            if (g < 1.0) { changed = 1; if (g < ming) { ming = g; worst_f = wf; }
+                           if (inb) inb[pos / HOP] = 1; }
             size_t blk = (size_t)HOP; if (pos + blk > n) blk = n - pos;
             for (size_t i = 0; i < blk; i++) {
                 double t = (double)i / (double)blk;
@@ -268,7 +271,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
 
     /* 持续音 RMS 上限：必须分块判 —— 整段 RMS 会被长静音稀释
      * （0.5s 满幅 + 59.5s 静音，全局 RMS 只有 8.2，整段判就会放行） */
-    double worst_rms = 0, rms_g = 1.0;
+    double peak_rms = 0, rms_g = 1.0;
     {
         const size_t RB = 2048;           /* ≈85ms 一块 */
         double prevg = 1.0;
@@ -277,8 +280,13 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
             double s2 = 0;
             for (size_t i = 0; i < len; i++) s2 += (double)pcm[pos+i] * pcm[pos+i];
             double r = sqrt(s2 / (double)len);
-            if (r > worst_rms) worst_rms = r;
-            double g = (r > RMS_CAP) ? RMS_CAP / r : 1.0;
+            /* 带内的 RMS 上限是 15；带外实测表允许满幅，就别用 15 无理压掉
+             * （600Hz peak 127 属安全区，之前被压到 peak 21 是误伤） */
+            int ib = inb && (inb[pos / HOP] ||
+                             (pos + HOP < n ? inb[(pos + HOP) / HOP] : 0));
+            double cap = ib ? RMS_CAP : RMS_CAP_FREE;
+            if (r > peak_rms) peak_rms = r;
+            double g = (r > cap) ? cap / r : 1.0;
             if (g < 1.0) { changed = 1; if (g < rms_g) rms_g = g; }
             for (size_t i = 0; i < len; i++) {         /* 块间线性过渡，不造陡边 */
                 double t = (double)i / (double)len;
@@ -288,9 +296,10 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
             pos += len;
         }
     }
+    free(inb);
     char rmsmsg[96] = "";
     if (rms_g < 1.0)
-        snprintf(rmsmsg, sizeof rmsmsg, "RMS %.1f>%.0f → ×%.2f", worst_rms, RMS_CAP, rms_g);
+        snprintf(rmsmsg, sizeof rmsmsg, "RMS %.1f>%.0f → ×%.2f", peak_rms, RMS_CAP, rms_g);
 
     /* 瞬态：厂商素材最大跳变仅 10，我们合成的 click 能到 127 → 这里直接压 */
     int maxj = 0;
@@ -303,9 +312,9 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     if (tg < 1.0) changed = 1;
 
     /* 长时播放只提示（共振是逐块检查的，不因时长变弱）；时长只关系发热 */
-    if ((int)n > 10 * SR && worst_rms > 10.0 && rep)
+    if ((int)n > 10 * SR && peak_rms > 10.0 && rep)
         printf("[提示] 时长 %.0fs 且峰值 RMS %.1f，注意马达发热（可 --max-ms 限制）\n",
-               (double)n / SR, worst_rms);
+               (double)n / SR, peak_rms);
 
     if (rep) {
         char msg[256] = "";
@@ -319,7 +328,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
                            "瞬态压到 %.0f%%（跳变 %d），", tg * 100, maxj);
         if (rmsmsg[0]) used = rep_add(msg, sizeof msg, used, "%s，", rmsmsg);
         if (used == 0) {
-            snprintf(msg, sizeof msg, "通过 (RMS %.1f, 最大跳变 %d)", worst_rms, maxj);
+            snprintf(msg, sizeof msg, "通过 (RMS %.1f, 最大跳变 %d)", peak_rms, maxj);
         } else if (used >= 3 &&
                    (unsigned char)msg[used-3] == 0xEF &&
                    (unsigned char)msg[used-2] == 0xBC &&
