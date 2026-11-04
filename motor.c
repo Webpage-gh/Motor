@@ -17,6 +17,7 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -114,6 +115,7 @@ static double band_scan(const signed char *x, int n, int level, double *worst_f,
     for (double f = 485.0; f <= 581.0; f += 2.0) {
         double a = goertzel_amp(x, n, f), lim = safe_limit(f, level);
         if (a > lim) { double k = lim / a; if (k < g) { g = k; if (worst_f) *worst_f = f; } }
+        if (worst_a && a > *worst_a) *worst_a = a;
     }
     return g;
 }
@@ -125,12 +127,25 @@ static signed char clip127(double v)
     return (signed char)lrint(v);
 }
 
+/* 追加一段报告文字：used 是“已写长度”，绝不越界 */
+static size_t rep_add(char *msg, size_t cap, size_t used, const char *fmt, ...)
+{
+    if (used + 1 >= cap) return cap - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(msg + used, cap - used, fmt, ap);
+    va_end(ap);
+    if (r < 0) return used;
+    size_t nu = used + (size_t)r;
+    return (nu < cap) ? nu : cap - 1;
+}
+
 /* ---- 瞬态限幅（治"撞壳"的 click） ----
  * 纯正弦的每样本最大跳变 ≈ 2πf/SR × peak：2.4kHz 满幅也只有 0.62×RMS；
  * 静音里单个满幅样本的跳变却是 127，宽频瞬态远超正弦。故：
  *   允许步长 = max(SLEW_MIN, 前视 64 样本的局部 RMS)
  * 需要的增益先做 ±16 样本最小值腐蚀（提前下压），再 32 点盒式平滑（不造新陡边）。
- * 返回最小增益（1.0 = 未处理），并回写处理后的最大跳变。
+ * 返回最小增益（1.0 = 未处理）；**返回 -1 = 内存不足，调用方必须拒绝播放**。
  */
 static double transient_guard(signed char *pcm, size_t n, int *maxj_out)
 {
@@ -138,10 +153,10 @@ static double transient_guard(signed char *pcm, size_t n, int *maxj_out)
 
     if (n < 2) { if (maxj_out) *maxj_out = 0; return 1.0; }
 
-    double *e = malloc(n * sizeof *e);   /* 过去的局部 RMS */
-    double *g = malloc(n * sizeof *g);   /* 需要的增益 / 平滑后的增益 */
-    double *s = malloc(n * sizeof *s);   /* 腐蚀后的增益 */
-    if (!e || !g || !s) { free(e); free(g); free(s); return 1.0; }
+    float *e = malloc(n * sizeof *e);    /* 过去的局部 RMS */
+    float *g = malloc(n * sizeof *g);    /* 需要的增益 / 平滑后的增益 */
+    float *s = malloc(n * sizeof *s);    /* 腐蚀后的增益 */
+    if (!e || !g || !s) { free(e); free(g); free(s); return -1.0; }   /* 失败不放行 */
 
     /* 前视 LOOK 的滑动 RMS：窗口 = [i-LOOK-WIN+1, i-LOOK] */
     double acc = 0;
@@ -256,6 +271,11 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     /* 瞬态：厂商素材最大跳变仅 10，我们合成的 click 能到 127 → 这里直接压 */
     int maxj = 0;
     double tg = transient_guard(pcm, n, &maxj);
+    if (tg < 0) {
+        if (rep) snprintf(rep, replen, "安全检查失败（内存不足），拒绝播放");
+        *np = n;
+        return -1;
+    }
     if (tg < 1.0) changed = 1;
 
     /* 长时播放只提示（共振是逐块检查的，不因时长变弱）；时长只关系发热 */
@@ -266,19 +286,23 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     if (rep) {
         char msg[256] = "";
         size_t used = 0;
-        if (cut) used += (size_t)snprintf(msg + used, sizeof msg - used, "截断到 %dms，", g_max_ms);
+        if (cut) used = rep_add(msg, sizeof msg, used, "截断到 %dms，", g_max_ms);
         if (ming < 1.0)
-            used += (size_t)snprintf(msg + used, sizeof msg - used,
-                                     "共振带 %.0fHz 压到 %.0f%%，", worst_f, ming * 100);
+            used = rep_add(msg, sizeof msg, used,
+                           "共振带 %.0fHz 压到 %.0f%%，", worst_f, ming * 100);
         if (tg < 1.0)
-            used += (size_t)snprintf(msg + used, sizeof msg - used,
-                                     "瞬态压到 %.0f%%（跳变 %d），", tg * 100, maxj);
-        if (rmsmsg[0])
-            used += (size_t)snprintf(msg + used, sizeof msg - used, "%s，", rmsmsg);
-        if (used == 0)
+            used = rep_add(msg, sizeof msg, used,
+                           "瞬态压到 %.0f%%（跳变 %d），", tg * 100, maxj);
+        if (rmsmsg[0]) used = rep_add(msg, sizeof msg, used, "%s，", rmsmsg);
+        if (used == 0) {
             snprintf(msg, sizeof msg, "通过 (RMS %.1f, 最大跳变 %d)", rms, maxj);
-        else if (used >= 2)                       /* 去掉末尾 "，" */
-            msg[used - 3] = 0;
+        } else if (used >= 3 &&
+                   (unsigned char)msg[used-3] == 0xEF &&
+                   (unsigned char)msg[used-2] == 0xBC &&
+                   (unsigned char)msg[used-1] == 0x8C) {     /* 去掉末尾全角逗号 */
+            used -= 3;
+            msg[used] = 0;
+        }
         snprintf(rep, replen, "%s", msg);
     }
     *np = n;
@@ -400,8 +424,9 @@ int motor_play(const signed char *pcm, size_t n, int mag)
         if (!buf) return -1;
         memcpy(buf, pcm, cap);
         char rep[256] = "";
-        motor_sanitize(buf, &n, mag, rep, sizeof rep);
+        int sr = motor_sanitize(buf, &n, mag, rep, sizeof rep);
         printf("[安全] %s\n", rep);
+        if (sr < 0) { free(buf); return -2; }   /* 安全检查失败 → 不播 */
         pcm = buf;
     }
 
@@ -457,16 +482,17 @@ int motor_tone(double hz, int ms, int peak, int mag)
 
 int main(int argc, char **argv)
 {
-    /* --no-safety 必须放在第一个参数 */
-    if (argc > 2 && !strcmp(argv[1], "--max-ms")) {
-        g_max_ms = atoi(argv[2]);
-        for (int i = 1; i < argc - 2; i++) argv[i] = argv[i+2];
-        argc -= 2;
-    }
-    if (argc > 1 && !strcmp(argv[1], "--no-safety")) {
-        g_safety = 0;
-        for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
-        argc--;
+    /* 前置选项：--max-ms N 与 --no-safety 可任意顺序、可重复 */
+    while (argc > 1) {
+        if (!strcmp(argv[1], "--max-ms") && argc > 2) {
+            g_max_ms = atoi(argv[2]);
+            for (int i = 1; i < argc - 2; i++) argv[i] = argv[i+2];
+            argc -= 2;
+        } else if (!strcmp(argv[1], "--no-safety")) {
+            g_safety = 0;
+            for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
+            argc--;
+        } else break;
     }
     const char *cmd = argc > 1 ? argv[1] : "";
     int mag = 0x7fff;
@@ -485,6 +511,7 @@ int main(int argc, char **argv)
         int ch = 0;
         if (g_safety) {
             ch = motor_sanitize(b, &keep, mag, rep, sizeof rep);
+            if (ch < 0) { printf("  ⇒ %s\n", rep); free(b); return 1; }
         } else {
             int mj = 0;
             for (size_t i = 1; i < keep; i++) { int d = abs(b[i] - b[i-1]); if (d > mj) mj = d; }
