@@ -46,6 +46,7 @@ static int parse_mag(const char *s)
 }
 static int g_safety = 1;      /* 1=自动安全检查（默认） */
 static int g_max_ms = 0;      /* 0=不截断（默认）；可 --max-ms 指定 */
+static int g_force = 0;       /* 1 = 绕过能量预算/时长上限（--force） */
 
 /* ================= 安全层 =================
  * 规则全部来自实测，不含新东西：
@@ -66,7 +67,11 @@ static const SafePt SAFE[] = {
 };
 #define NSAFE ((int)(sizeof SAFE / sizeof SAFE[0]))
 #define RMS_CAP 15.0     /* 带内持续音上限（带外按实测表放行到满幅） */
-#define RMS_CAP_FREE 90.0 /* 带外无位移风险的持续音上限：peak 127 的 RMS */
+#define RMS_CAP_FREE 90.0 /* 带外上限（= peak 127）：实测 40~11700Hz 满幅可放 */
+#define DOSE_MAX   121500.0 /* 能量预算 ≈ 满幅(RMS90) 15s；超了拒绝播放 */
+#define DUR_MAX_S  300.0    /* 时长硬上限 */
+#define EXIT_DOSE  3        /* 退出码：超剂量/超时长被拒 */
+#define HPF_HZ      25.0  /* 去直流/超低频：实测 <40Hz 会"敲手机"，DC 最狠 */
 #define SLEW_MIN 40.0   /* 允许的每样本最大跳变（厂商素材实测 ≤10） */
 
 static int level_of(int mag)
@@ -133,6 +138,26 @@ static signed char clip127(double v)
     return (signed char)lrint(v);
 }
 
+/* 一阶高通（20Hz）：去掉直流与 <40Hz 分量。
+ * 实测表：40Hz 满幅安全，更低会从"微弱"变成"敲手机"；直流是最极端的情况 */
+static int hpf_apply(signed char *pcm, size_t n)
+{
+    double a = 1.0 / (1.0 + 2.0 * M_PI * HPF_HZ / SR);
+    double y1 = 0, y2 = 0, xp = 0, y1p = 0;
+    int chg = 0;
+    for (size_t i = 0; i < n; i++) {          /* 二级级联：40Hz -3dB，20Hz -8dB，DC 全灭 */
+        double x = (double)pcm[i];
+        y1 = a * (y1 + x - xp);
+        xp = x;
+        y2 = a * (y2 + y1 - y1p);
+        y1p = y1;
+        signed char v = clip127(y2);
+        if (v != pcm[i]) chg = 1;
+        pcm[i] = v;
+    }
+    return chg;
+}
+
 /* 追加一段报告文字：used 是“已写长度”，绝不越界 */
 static size_t rep_add(char *msg, size_t cap, size_t used, const char *fmt, ...)
 {
@@ -165,14 +190,23 @@ static double transient_guard(signed char *pcm, size_t n, int *maxj_out)
     if (!e || !g || !s) { free(e); free(g); free(s); return -1.0; }   /* 失败不放行 */
 
     /* 前视 LOOK 的滑动 RMS：窗口 = [i-LOOK-WIN+1, i-LOOK] */
-    double acc = 0;
+    /* 开头没有历史：用首个窗口的 RMS 预估，否则高频正弦会被"头部静音"误判成 click */
+    double acc = 0, rms0 = 0;
+    size_t n0 = (n < (size_t)(LOOK + WIN)) ? n : (size_t)(LOOK + WIN);
+    for (size_t i = 0; i < n0; i++) rms0 += (double)pcm[i] * pcm[i];
+    rms0 = sqrt(rms0 / (double)(n0 ? n0 : 1));
+
+    long beg = 0;
     for (size_t i = 0; i < n; i++) {
         long end = (long)i - LOOK;
-        if (end < 0) { e[i] = 0; continue; }
-        acc += (double)pcm[end] * pcm[end];
-        long beg = end - WIN + 1;
-        if (beg - 1 >= 0) acc -= (double)pcm[beg - 1] * pcm[beg - 1];
-        if (acc < 0) acc = 0;
+        if (end >= 0) {                       /* 滚动窗口始终累加，否则统计会失真 */
+            acc += (double)pcm[end] * pcm[end];
+            beg = end - WIN + 1;
+            if (beg - 1 >= 0) acc -= (double)pcm[beg - 1] * pcm[beg - 1];
+            if (acc < 0) acc = 0;
+        }
+        /* 窗口未填满（前 8ms）用首窗估计，否则斜坡段会把高频正弦误判成 click */
+        if (end < 0 || i < (size_t)(LOOK + WIN)) { e[i] = (float)rms0; continue; }
         double cnt = (double)(end - (beg < 0 ? 0 : beg) + 1);
         e[i] = sqrt(acc / (cnt < 1 ? 1 : cnt));
     }
@@ -180,7 +214,11 @@ static double transient_guard(signed char *pcm, size_t n, int *maxj_out)
     /* 每个样本需要的增益 */
     for (size_t i = 0; i < n; i++) {
         double step = i ? fabs((double)pcm[i] - (double)pcm[i-1]) : fabs((double)pcm[i]);
-        double allow = (e[i] > SLEW_MIN) ? e[i] : SLEW_MIN;
+        /* 允许步长 = max(40, 3×前视局部 RMS)：纯正弦的最大步长/ RMS 最多 2.83
+         * （11.7kHz 顶到 Nyquist 也只有 2.83），所以正弦一路放行；click 的
+         * 局部 RMS 近 0，只能拿 40 的下限 → 被压。早期用 1×RMS 会把高频正弦误杀。 */
+        double allow = 3.0 * e[i];
+        if (allow < SLEW_MIN) allow = SLEW_MIN;
         g[i] = (step > allow) ? allow / step : 1.0;
     }
 
@@ -243,6 +281,9 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     }
 
     /* 逐块扫描并施加带平滑的增益 */
+    /* 去直流/超低频 */
+    if (hpf_apply(pcm, n)) changed = 1;
+
     unsigned char *inb = calloc(n / HOP + 2, 1);   /* 每 HOP 块是否命中共振带 */
     if (n >= 512) {
         size_t pos = 0;
@@ -271,7 +312,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
 
     /* 持续音 RMS 上限：必须分块判 —— 整段 RMS 会被长静音稀释
      * （0.5s 满幅 + 59.5s 静音，全局 RMS 只有 8.2，整段判就会放行） */
-    double peak_rms = 0, rms_g = 1.0;
+    double peak_rms = 0, rms_g = 1.0, capmin = 0, dose = 0;
     {
         const size_t RB = 2048;           /* ≈85ms 一块 */
         double prevg = 1.0;
@@ -285,6 +326,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
             int ib = inb && (inb[pos / HOP] ||
                              (pos + HOP < n ? inb[(pos + HOP) / HOP] : 0));
             double cap = ib ? RMS_CAP : RMS_CAP_FREE;
+            if (cap < capmin || capmin == 0) capmin = cap;
             if (r > peak_rms) peak_rms = r;
             double g = (r > cap) ? cap / r : 1.0;
             if (g < 1.0) { changed = 1; if (g < rms_g) rms_g = g; }
@@ -292,6 +334,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
                 double t = (double)i / (double)len;
                 pcm[pos+i] = clip127((double)pcm[pos+i] * (prevg + (g - prevg) * t));
             }
+            dose += (r * g) * (r * g) * ((double)len / SR);   /* I²R·t 的等价量 */
             prevg = g;
             pos += len;
         }
@@ -299,7 +342,21 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     free(inb);
     char rmsmsg[96] = "";
     if (rms_g < 1.0)
-        snprintf(rmsmsg, sizeof rmsmsg, "RMS %.1f>%.0f → ×%.2f", peak_rms, RMS_CAP, rms_g);
+        snprintf(rmsmsg, sizeof rmsmsg, "RMS %.1f>%.0f → ×%.2f", peak_rms, capmin, rms_g);
+
+    /* 事前拒绝：超能量预算或超时长 → 不播（除非 --force） */
+    if (!g_force && (n > (size_t)(DUR_MAX_S * SR) || dose > DOSE_MAX)) {
+        if (rep)
+            snprintf(rep, replen,
+                     "拒绝播放：%s%.0f > %.0f\n"
+                     "       实际 %.1fs，最高块 RMS %.1f；绕过用 --force，截短用 --max-ms\n",
+                     (dose > DOSE_MAX) ? "能量剂量" : "时长(s)",
+                     (dose > DOSE_MAX) ? dose : (double)n / SR,
+                     (dose > DOSE_MAX) ? DOSE_MAX : DUR_MAX_S,
+                     (double)n / SR, peak_rms);
+        *np = n;
+        return -3;
+    }
 
     /* 瞬态：厂商素材最大跳变仅 10，我们合成的 click 能到 127 → 这里直接压 */
     int maxj = 0;
@@ -459,7 +516,7 @@ int motor_play(const signed char *pcm, size_t n, int mag)
         char rep[256] = "";
         int sr = motor_sanitize(buf, &n, mag, rep, sizeof rep);
         printf("[安全] %s\n", rep);
-        if (sr < 0) { free(buf); return -2; }   /* 安全检查失败 → 不播 */
+        if (sr < 0) { free(buf); return (sr == -3) ? -3 : -2; }  /* 失败/超剂量 → 不播 */
         pcm = buf;
     }
 
@@ -532,6 +589,10 @@ int main(int argc, char **argv)
             g_max_ms = (int)v;
             for (int i = 1; i < argc - 2; i++) argv[i] = argv[i+2];
             argc -= 2;
+        } else if (!strcmp(argv[1], "--force")) {
+            g_force = 1;
+            for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
+            argc--;
         } else if (!strcmp(argv[1], "--no-safety")) {
             g_safety = 0;
             for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
@@ -555,7 +616,7 @@ int main(int argc, char **argv)
         int ch = 0;
         if (g_safety) {
             ch = motor_sanitize(b, &keep, mag, rep, sizeof rep);
-            if (ch < 0) { printf("  ⇒ %s\n", rep); free(b); return 1; }
+            if (ch < 0) { printf("  ⇒ %s", rep); free(b); return (ch == -3) ? EXIT_DOSE : 1; }
         } else {
             int mj = 0;
             for (size_t i = 1; i < keep; i++) { int d = abs(b[i] - b[i-1]); if (d > mj) mj = d; }
@@ -599,6 +660,7 @@ int main(int argc, char **argv)
         printf("读入 %ld 字节 (%.2fs) mag=0x%04X\n", n, (double)n / SR, mag);
         int r = motor_play(b, n, mag);
         free(b);
+        if (r == -3) return EXIT_DOSE;
         return r < 0;
     }
 
@@ -609,6 +671,7 @@ int main(int argc, char **argv)
         "  motor check <file.bin> [mag]     只做安全体检，不播放\n"
         "  motor stop\n"
         "  motor --max-ms <N> ...           限制单次时长（0=不限，默认）\n"
-        "  motor --no-safety ...            跳过安全检查\n");
+        "  motor --no-safety ...            跳过安全检查\n"
+        "  motor --force ...                绕过能量预算/时长上限（超剂量时用）\n");
     return 2;
 }
