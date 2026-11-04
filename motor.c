@@ -35,6 +35,15 @@
 #endif
 
 static int g_fd = -1;
+
+/* mag 统一钳到 [0x3FFF, 0x7FFF]：低于 0x3FFF 驱动本来就取 level 0x1E */
+static int parse_mag(const char *s)
+{
+    long v = strtol(s, NULL, 0);
+    if (v < 0x3FFF) v = 0x3FFF;
+    if (v > 0x7FFF) v = 0x7FFF;
+    return (int)v;
+}
 static int g_safety = 1;      /* 1=自动安全检查（默认） */
 static int g_max_ms = 0;      /* 0=不截断（默认）；可 --max-ms 指定 */
 
@@ -80,8 +89,6 @@ static double safe_limit(double f, int level)
                 break;
             }
         }
-        /* 落在两个共振带之间的空隙（190~485）不算带内 */
-        if (f > 190.0 && f < 485.0) inband = 0;
     }
     v = v * relax;
     if (inband) v *= 0.8;
@@ -104,18 +111,16 @@ static double goertzel_amp(const signed char *x, int n, double f)
 }
 
 /* 扫描共振带：返回需要的最小增益，并记录肇事频率 */
-static double band_scan(const signed char *x, int n, int level, double *worst_f, double *worst_a)
+static double band_scan(const signed char *x, int n, int level, double *worst_f)
 {
     double g = 1.0;
     for (double f = 152.0; f <= 190.0; f += 2.0) {
         double a = goertzel_amp(x, n, f), lim = safe_limit(f, level);
         if (a > lim) { double k = lim / a; if (k < g) { g = k; if (worst_f) *worst_f = f; } }
-        if (worst_a && a > *worst_a) *worst_a = a;
     }
     for (double f = 485.0; f <= 581.0; f += 2.0) {
         double a = goertzel_amp(x, n, f), lim = safe_limit(f, level);
         if (a > lim) { double k = lim / a; if (k < g) { g = k; if (worst_f) *worst_f = f; } }
-        if (worst_a && a > *worst_a) *worst_a = a;
     }
     return g;
 }
@@ -228,20 +233,26 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     int changed = 0, cut = 0;
 
     /* 时长截断：必须真的截掉，并清零尾部（否则尾巴会以原幅裸奔） */
-    if (g_max_ms > 0 && (int)n > g_max_ms * SR / 1000) {
-        size_t keep = (size_t)g_max_ms * SR / 1000;
+    size_t lim = (size_t)g_max_ms * (size_t)SR / 1000;
+    if (g_max_ms > 0 && n > lim) {
+        size_t keep = lim;
         memset(pcm + keep, 0, n - keep);
         n = keep;
         changed = cut = 1;
     }
 
     /* 逐块扫描并施加带平滑的增益 */
-    if ((int)n >= NF) {
-        size_t pos = 0; double prevg = 1.0;
+    if (n >= 512) {
+        size_t pos = 0;
+        double wf0 = 0;
+        int n0 = (n > (size_t)NF) ? NF : (int)n;
+        double prevg = band_scan(pcm, n0, level, &wf0);
+        if (prevg < 1.0) { changed = 1; ming = prevg; worst_f = wf0; }
         while (pos < n) {
             int len = (int)((n - pos > (size_t)NF) ? NF : (n - pos));
-            double wf = 0, wa = 0;
-            double g = (len >= 512) ? band_scan(pcm + pos, len, level, &wf, &wa) : 1.0;
+            double wf = 0;
+            /* 尾部不足一块时沿用上一块增益：原来给 1.0，等于让最后 ~20ms 裸奔 */
+            double g = (len >= 512) ? band_scan(pcm + pos, len, level, &wf) : prevg;
             if (g < 1.0) { changed = 1; if (g < ming) { ming = g; worst_f = wf; } }
             size_t blk = (size_t)HOP; if (pos + blk > n) blk = n - pos;
             for (size_t i = 0; i < blk; i++) {
@@ -255,18 +266,31 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
         }
     }
 
-    /* 持续音 RMS 上限 */
-    double s2 = 0;
-    for (size_t i = 0; i < n; i++) s2 += (double)pcm[i] * pcm[i];
-    double rms = sqrt(s2 / (n ? n : 1));
-    char rmsmsg[96] = "";
-    if (rms > RMS_CAP) {
-        double k = RMS_CAP / rms;
-        for (size_t i = 0; i < n; i++) pcm[i] = (signed char)lrint(pcm[i] * k);
-        snprintf(rmsmsg, sizeof rmsmsg, "RMS %.1f>%.0f → ×%.2f", rms, RMS_CAP, k);
-        changed = 1;
-        rms = RMS_CAP;
+    /* 持续音 RMS 上限：必须分块判 —— 整段 RMS 会被长静音稀释
+     * （0.5s 满幅 + 59.5s 静音，全局 RMS 只有 8.2，整段判就会放行） */
+    double worst_rms = 0, rms_g = 1.0;
+    {
+        const size_t RB = 2048;           /* ≈85ms 一块 */
+        double prevg = 1.0;
+        for (size_t pos = 0; pos < n; ) {
+            size_t len = (n - pos > RB) ? RB : n - pos;
+            double s2 = 0;
+            for (size_t i = 0; i < len; i++) s2 += (double)pcm[pos+i] * pcm[pos+i];
+            double r = sqrt(s2 / (double)len);
+            if (r > worst_rms) worst_rms = r;
+            double g = (r > RMS_CAP) ? RMS_CAP / r : 1.0;
+            if (g < 1.0) { changed = 1; if (g < rms_g) rms_g = g; }
+            for (size_t i = 0; i < len; i++) {         /* 块间线性过渡，不造陡边 */
+                double t = (double)i / (double)len;
+                pcm[pos+i] = clip127((double)pcm[pos+i] * (prevg + (g - prevg) * t));
+            }
+            prevg = g;
+            pos += len;
+        }
     }
+    char rmsmsg[96] = "";
+    if (rms_g < 1.0)
+        snprintf(rmsmsg, sizeof rmsmsg, "RMS %.1f>%.0f → ×%.2f", worst_rms, RMS_CAP, rms_g);
 
     /* 瞬态：厂商素材最大跳变仅 10，我们合成的 click 能到 127 → 这里直接压 */
     int maxj = 0;
@@ -279,9 +303,9 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
     if (tg < 1.0) changed = 1;
 
     /* 长时播放只提示（共振是逐块检查的，不因时长变弱）；时长只关系发热 */
-    if ((int)n > 10 * SR && rms > 10.0 && rep)
-        printf("[提示] 时长 %.0fs 且 RMS %.1f，注意马达发热（可 --max-ms 限制）\n",
-               (double)n / SR, rms);
+    if ((int)n > 10 * SR && worst_rms > 10.0 && rep)
+        printf("[提示] 时长 %.0fs 且峰值 RMS %.1f，注意马达发热（可 --max-ms 限制）\n",
+               (double)n / SR, worst_rms);
 
     if (rep) {
         char msg[256] = "";
@@ -295,7 +319,7 @@ static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size
                            "瞬态压到 %.0f%%（跳变 %d），", tg * 100, maxj);
         if (rmsmsg[0]) used = rep_add(msg, sizeof msg, used, "%s，", rmsmsg);
         if (used == 0) {
-            snprintf(msg, sizeof msg, "通过 (RMS %.1f, 最大跳变 %d)", rms, maxj);
+            snprintf(msg, sizeof msg, "通过 (RMS %.1f, 最大跳变 %d)", worst_rms, maxj);
         } else if (used >= 3 &&
                    (unsigned char)msg[used-3] == 0xEF &&
                    (unsigned char)msg[used-2] == 0xBC &&
@@ -399,7 +423,7 @@ static void cleanup(int id)
     clear_custom_flag();
     sys_write("activate", "0");
     sys_write("activate_mode", "0");
-    for (int i = 0; i < 150 && cw_free() < MAXBUF; i++) nap(20);
+    for (int i = 0; i < 150; i++) { int f = cw_free(); if (f < 0 || f >= MAXBUF) break; nap(20); }
 }
 
 int motor_open(void)
@@ -454,7 +478,7 @@ int motor_play(const signed char *pcm, size_t n, int mag)
     }
     close(cw);
     /* 真正的"播完"= free_size 回到 max_size（不能靠猜时间） */
-    for (int i = 0; i < 750 && cw_free() < MAXBUF; i++) nap(20);
+    for (int i = 0; i < 750 && cw_free() >= 0 && cw_free() < MAXBUF; i++) nap(20);
     nap(250);
     cleanup(id);
     free(buf);
@@ -463,6 +487,10 @@ int motor_play(const signed char *pcm, size_t n, int mag)
 
 int motor_tone(double hz, int ms, int peak, int mag)
 {
+    if (peak > 127) peak = 127;
+    if (peak < 0) peak = 0;
+    if (ms < 1) ms = 1;
+    if (ms > 1000 * 60 * 10) ms = 1000 * 60 * 10;
     int n = (int)((long long)SR * ms / 1000);
     signed char *b = malloc(n);
     if (!b) return -1;
@@ -485,7 +513,14 @@ int main(int argc, char **argv)
     /* 前置选项：--max-ms N 与 --no-safety 可任意顺序、可重复 */
     while (argc > 1) {
         if (!strcmp(argv[1], "--max-ms") && argc > 2) {
-            g_max_ms = atoi(argv[2]);
+            char *end = NULL;
+            long v = strtol(argv[2], &end, 10);
+            if (!end || *end || v < 0) {
+                fprintf(stderr, "--max-ms 需要非负整数（毫秒），收到 \"%s\"\n", argv[2]);
+                return 2;
+            }
+            if (v > 86400000L) v = 86400000L;   /* 24h 上限，避开溢出 */
+            g_max_ms = (int)v;
             for (int i = 1; i < argc - 2; i++) argv[i] = argv[i+2];
             argc -= 2;
         } else if (!strcmp(argv[1], "--no-safety")) {
@@ -499,7 +534,7 @@ int main(int argc, char **argv)
 
     /* check 不需要打开设备：只做安全体检 */
     if (!strcmp(cmd, "check") && argc >= 3) {
-        if (argc > 3) mag = (int)strtol(argv[3], NULL, 0);
+        if (argc > 3) mag = parse_mag(argv[3]);
         FILE *f = fopen(argv[2], "rb");
         if (!f) { perror(argv[2]); return 1; }
         fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -536,14 +571,14 @@ int main(int argc, char **argv)
         double hz = atof(argv[2]);
         int ms = atoi(argv[3]);
         int peak = argc > 4 ? atoi(argv[4]) : 60;
-        if (argc > 5) mag = (int)strtol(argv[5], NULL, 0);
+        if (argc > 5) mag = parse_mag(argv[5]);
         if (peak > 127) peak = 127;
         printf("tone %.0fHz %dms peak=%d mag=0x%04X\n", hz, ms, peak, mag);
         return motor_tone(hz, ms, peak, mag) < 0;
     }
 
     if (!strcmp(cmd, "play") && argc >= 3) {
-        if (argc > 3) mag = (int)strtol(argv[3], NULL, 0);
+        if (argc > 3) mag = parse_mag(argv[3]);
         FILE *f = fopen(argv[2], "rb");
         if (!f) { perror(argv[2]); return 1; }
         fseek(f, 0, SEEK_END);
