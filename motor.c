@@ -47,6 +47,7 @@ static int parse_mag(const char *s)
 static int g_safety = 1;      /* 1=自动安全检查（默认） */
 static int g_max_ms = 0;      /* 0=不截断（默认）；可 --max-ms 指定 */
 static int g_force = 0;       /* 1 = 绕过能量预算/时长上限（--force） */
+static int g_dry = 0;         /* 1 = 只体检不播放（--dry，用于 sweep/tone） */
 
 /* ================= 安全层 =================
  * 规则全部来自实测，不含新东西：
@@ -574,6 +575,67 @@ int motor_tone(double hz, int ms, int peak, int mag)
     return r;
 }
 
+/* 生成扫频波形：lin=0 对数（每倍频程等时），lin=1 线性 */
+static signed char *gen_sweep(double f0, double f1, int ms, int peak, int lin, int *np)
+{
+    if (peak > 127) peak = 127;
+    if (peak < 0) peak = 0;
+    if (ms < 1) ms = 1;
+    if (ms > 600000) ms = 600000;              /* 10 分钟上限 */
+    if (f0 < 20) f0 = 20;
+    if (f1 < 20) f1 = 20;
+    if (f0 > 12000) f0 = 12000;
+    if (f1 > 12000) f1 = 12000;
+    int n = (int)((long long)SR * ms / 1000);
+    if (n < 1) n = 1;
+    signed char *b = malloc(n);
+    if (!b) return NULL;
+    int fade = SR * 20 / 1000;
+    if (fade * 2 > n) fade = n / 2;
+    double T = (double)n / SR;
+    for (int i = 0; i < n; i++) {
+        double t = (double)i / SR;
+        double ph;
+        if (lin) {
+            ph = 2 * M_PI * (f0 * t + (f1 - f0) * t * t / (2 * T));
+        } else {
+            double k = log(f1 / f0);
+            ph = (fabs(k) < 1e-9) ? 2 * M_PI * f0 * t
+                                  : 2 * M_PI * f0 * T / k * (exp(k * t / T) - 1);
+        }
+        double e = 1.0;
+        if (i < fade) e = (double)i / fade;
+        else if (i > n - fade) e = (double)(n - i) / fade;
+        b[i] = (signed char)lrint(peak * e * sin(ph));
+    }
+    *np = n;
+    return b;
+}
+
+/* 只体检不播放：与 check 共用，原地修改 b 后打印报告 */
+static int motor_report(const char *label, signed char *b, size_t n, int mag)
+{
+    char rep[256] = "";
+    size_t cap = n, keep = cap;
+    int ch = 0;
+    if (g_safety) {
+        ch = motor_sanitize(b, &keep, mag, rep, sizeof rep);
+        if (ch < 0) { printf("  ⇒ %s", rep); return (ch == -3) ? EXIT_DOSE : 1; }
+    } else {
+        int mj = 0;
+        for (size_t i = 1; i < keep; i++) { int d = abs(b[i] - b[i-1]); if (d > mj) mj = d; }
+        snprintf(rep, sizeof rep, "--no-safety：原样（最大跳变 %d）", mj);
+        keep = cap;
+    }
+    printf("%s  长度 %.2fs → %.2fs  mag=0x%04X (level %d)\n",
+           label, (double)n / SR, (double)keep / SR, mag, level_of(mag));
+    if (keep != cap)
+        printf("  注意：实际播放只会到 %.2fs（尾部已清零）\n", (double)keep / SR);
+    printf("  ⇒ %s\n", rep);
+    printf("  %s\n", ch ? "已修改（播放时会用这一版）" : "不需修改");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     /* 前置选项：--max-ms N 与 --no-safety 可任意顺序、可重复 */
@@ -597,6 +659,10 @@ int main(int argc, char **argv)
             g_safety = 0;
             for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
             argc--;
+        } else if (!strcmp(argv[1], "--dry")) {
+            g_dry = 1;
+            for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
+            argc--;
         } else break;
     }
     const char *cmd = argc > 1 ? argv[1] : "";
@@ -611,26 +677,36 @@ int main(int argc, char **argv)
         signed char *b = malloc(n);
         if (!b || fread(b, 1, n, f) != (size_t)n) { fputs("读文件失败\n", stderr); return 1; }
         fclose(f);
-        char rep[256] = "";
-        size_t cap = (size_t)n, keep = cap;
-        int ch = 0;
-        if (g_safety) {
-            ch = motor_sanitize(b, &keep, mag, rep, sizeof rep);
-            if (ch < 0) { printf("  ⇒ %s", rep); free(b); return (ch == -3) ? EXIT_DOSE : 1; }
-        } else {
-            int mj = 0;
-            for (size_t i = 1; i < keep; i++) { int d = abs(b[i] - b[i-1]); if (d > mj) mj = d; }
-            snprintf(rep, sizeof rep, "--no-safety：原样（最大跳变 %d）", mj);
-            keep = cap;
-        }
-        printf("%s  长度 %.2fs → %.2fs  mag=0x%04X (level %d)\n",
-               argv[2], (double)n / SR, (double)keep / SR, mag, level_of(mag));
-        if (keep != cap)
-            printf("  注意：实际播放只会到 %.2fs（尾部已清零）\n", (double)keep / SR);
-        printf("  ⇒ %s\n", rep);
-        printf("  %s\n", ch ? "已修改（播放时会用这一版）" : "不需修改");
+        int r = motor_report(argv[2], b, (size_t)n, mag);
         free(b);
-        return 0;
+        return r;
+    }
+
+    /* sweep：--dry 时不需要设备，可普通用户跑 */
+    if (!strcmp(cmd, "sweep") && argc >= 5) {
+        double f0 = atof(argv[2]), f1 = atof(argv[3]);
+        int ms = atoi(argv[4]);
+        int peak = 100, lin = 0, nnum = 0;
+        for (int i = 5; i < argc; i++) {
+            if (!strcmp(argv[i], "lin")) { lin = 1; continue; }
+            if (!strcmp(argv[i], "log")) { lin = 0; continue; }
+            if (nnum == 0) peak = atoi(argv[i]);
+            else if (nnum == 1) mag = parse_mag(argv[i]);
+            nnum++;
+        }
+        int n = 0;
+        signed char *b = gen_sweep(f0, f1, ms, peak, lin, &n);
+        if (!b) { fputs("内存不足\n", stderr); return 1; }
+        char lab[160];
+        snprintf(lab, sizeof lab, "sweep %.0f→%.0fHz %s %dms peak=%d",
+                 f0, f1, lin ? "线性" : "对数", ms, peak > 127 ? 127 : peak);
+        if (g_dry) { int r = motor_report(lab, b, (size_t)n, mag); free(b); return r; }
+        if (motor_open() < 0) { free(b); return 1; }
+        printf("%s mag=0x%04X\n", lab, mag);
+        int r = motor_play(b, (size_t)n, mag);
+        free(b);
+        if (r == -3) return EXIT_DOSE;
+        return r < 0;
     }
 
     if (motor_open() < 0) return 1;
@@ -669,7 +745,10 @@ int main(int argc, char **argv)
         "  motor tone <Hz> <ms> [peak] [mag]\n"
         "  motor play <file.bin> [mag]\n"
         "  motor check <file.bin> [mag]     只做安全体检，不播放\n"
+        "  motor sweep <f0> <f1> <ms> [peak] [mag] [lin]\n"
+        "                                   扫频（默认对数，加 lin 线性）\n"
         "  motor stop\n"
+        "  motor --dry ...                  只体检不播放（配合 sweep）\n"
         "  motor --max-ms <N> ...           限制单次时长（0=不限，默认）\n"
         "  motor --no-safety ...            跳过安全检查\n"
         "  motor --force ...                绕过能量预算/时长上限（超剂量时用）\n");

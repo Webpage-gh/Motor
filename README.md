@@ -91,10 +91,25 @@ void motor_stop(void);                                        // 立即静音
 
 ```bash
 motor check <file.bin> [mag]      # 只体检，不振动（不需要 root）
+motor sweep <f0> <f1> <ms> [peak] [mag] [lin]   # 扫频，默认对数
+motor --dry sweep 40 1200 4000   # 扫频只体检（普通用户可跑）
 motor --max-ms 5000 play ...      # 真正截断到 5 秒（非负整数，非法值报错退出）
 motor --force play long.bin       # 绕过能量预算/时长上限（超量时才需要）
 motor --no-safety play ...        # 跳过安全层（不建议）
 ```
+
+**扫频 `sweep`**
+
+```bash
+motor sweep 40 1200 4000          # 40→1200Hz，4 秒，对数（每倍频程等时）
+motor sweep 1200 40 4000 60       # 反向扫频，峰值 60
+motor sweep 200 1000 4000 100 lin # 线性扫频（等 Hz/秒）
+```
+
+- 对数默认：低频段停留更久，探共振/听死角更公平；线性适合找某一窄带；
+- 自带 20ms 起落，不会因为切口产生 click；
+- **同样过安全层**：扫过 152–190 / 485–581 时会被自动压制（这是特性不是 bug，
+  想听“未处理的原始扫频”得加 `--no-safety`，但那会真的撞共振带）。
 
 **健壮性约定**
 
