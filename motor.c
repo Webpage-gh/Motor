@@ -636,6 +636,22 @@ static int motor_report(const char *label, signed char *b, size_t n, int mag)
     return 0;
 }
 
+static void usage(void)
+{
+    fprintf(stderr,
+        "motor —— 最小马达调用（内置安全层）\n"
+        "  motor tone <Hz> <ms> [peak] [mag]\n"
+        "  motor play <file.bin> [mag]\n"
+        "  motor check <file.bin> [mag]     只做安全体检，不播放\n"
+        "  motor sweep <f0> <f1> <ms> [peak] [mag] [lin]\n"
+        "                                   扫频（默认对数，加 lin 线性）\n"
+        "  motor stop\n"
+        "  motor --dry ...                  只体检不播放（配合 sweep）\n"
+        "  motor --max-ms <N> ...           限制单次时长（0=不限，默认）\n"
+        "  motor --no-safety ...            跳过安全检查\n"
+        "  motor --force ...                绕过能量预算/时长上限（超剂量时用）\n");
+}
+
 int main(int argc, char **argv)
 {
     /* 前置选项：--max-ms N 与 --no-safety 可任意顺序、可重复 */
@@ -666,6 +682,7 @@ int main(int argc, char **argv)
         } else break;
     }
     const char *cmd = argc > 1 ? argv[1] : "";
+    if (!cmd[0] || !strcmp(cmd, "help") || !strcmp(cmd, "-h")) { usage(); return 2; }
     int mag = 0x7fff;
 
     /* check 不需要打开设备：只做安全体检 */
@@ -740,17 +757,6 @@ int main(int argc, char **argv)
         return r < 0;
     }
 
-    fprintf(stderr,
-        "motor —— 最小马达调用（内置安全层）\n"
-        "  motor tone <Hz> <ms> [peak] [mag]\n"
-        "  motor play <file.bin> [mag]\n"
-        "  motor check <file.bin> [mag]     只做安全体检，不播放\n"
-        "  motor sweep <f0> <f1> <ms> [peak] [mag] [lin]\n"
-        "                                   扫频（默认对数，加 lin 线性）\n"
-        "  motor stop\n"
-        "  motor --dry ...                  只体检不播放（配合 sweep）\n"
-        "  motor --max-ms <N> ...           限制单次时长（0=不限，默认）\n"
-        "  motor --no-safety ...            跳过安全检查\n"
-        "  motor --force ...                绕过能量预算/时长上限（超剂量时用）\n");
+    usage();
     return 2;
 }
