@@ -77,10 +77,10 @@ static const SafePt SAFE[] = {
 
 /* 带内余量系数（按带分开，实验用）：152–190Hz / 485–581Hz */
 #ifndef HEAD_B1
-#define HEAD_B1 0.25    /* 原为 0.8；可在编译时 -DHEAD_B1=0.8 复原 */
+#define HEAD_B1 0.03    /* 152–190Hz：实测听感最均衡（≈关闭该带）；-DHEAD_B1=0.8 复原旧值 */
 #endif
 #ifndef HEAD_B2
-#define HEAD_B2 1.00    /* 原为 0.8；可在编译时 -DHEAD_B2=0.8 复原 */
+#define HEAD_B2 1.00    /* 485–581Hz：不额外打折，直接用实测表值 */
 #endif
 
 static int level_of(int mag)
