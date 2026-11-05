@@ -75,6 +75,14 @@ static const SafePt SAFE[] = {
 #define HPF_HZ      25.0  /* 去直流/超低频：实测 <40Hz 会"敲手机"，DC 最狠 */
 #define SLEW_MIN 40.0   /* 允许的每样本最大跳变（厂商素材实测 ≤10） */
 
+/* 带内余量系数（按带分开，实验用）：152–190Hz / 485–581Hz */
+#ifndef HEAD_B1
+#define HEAD_B1 0.25    /* 原为 0.8；可在编译时 -DHEAD_B1=0.8 复原 */
+#endif
+#ifndef HEAD_B2
+#define HEAD_B2 1.00    /* 原为 0.8；可在编译时 -DHEAD_B2=0.8 复原 */
+#endif
+
 static int level_of(int mag)
 {
     if (mag >= 0x7fff) return 0x80;
@@ -98,7 +106,7 @@ static double safe_limit(double f, int level)
         }
     }
     v = v * relax;
-    if (inband) v *= 0.8;
+    if (inband) v *= (f <= 190.0) ? HEAD_B1 : HEAD_B2;   /* 两段共振带分开给余量 */
     return v > 127.0 ? 127.0 : v;
 }
 
