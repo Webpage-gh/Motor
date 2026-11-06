@@ -18,6 +18,34 @@ su -c '~/motor/motor stop'                  # 立即静音
 > Termux 里 `su -c` 内是 `/system/bin/sh`，**不会展开 `~`**，
 > 所以给 `su` 的路径要写全：`/data/data/com.termux/files/home/motor/motor`。
 
+### 放整首歌（一条命令）
+
+```bash
+./mplay.sh 歌.mp3                 # 从头放
+./mplay.sh 歌.mp3 30 60           # 30s 起放 60 秒
+./mplay.sh 歌.mp3 30 60 0x5FFF    # 再加音量档
+./mplay.sh --dry 歌.mp3 30 10     # 只体检，不振动（普通用户可跑）
+./mplay.sh --norm 歌.mp3 30 60    # 量化前归一化到 0.9（约 +6dB，实测“略响、无共振”）
+```
+
+手写等价于：
+
+```bash
+ffmpeg -v error -ss 30 -t 60 -i 歌.mp3 -af "afade=t=in:st=0:d=0.02,afade=t=out:st=59.98:d=0.02" \
+       -f f32le -ac 1 -ar 24000 - | su -c 'motor/motor stdin'
+```
+
+`stdin` 会**先把整段读完再开始振**（安全层要总剂量才能决定放不放）：
+
+| 长度 | 读取缓冲 | 起播延迟 |
+|---|---|---|
+| 30 s | 3 MB | <1 s |
+| 60 s | 6 MB | ~1 s |
+| 300 s | 29 MB | ~4 s |
+
+`motor stdin` 自己做：降混已是 ffmpeg 完成 → **8bit 量化带 ±1 LSB 三角抖动**（比原来
+`int16→s8` 截断的噪声底干净）→ `--norm` 归一化 → 安全层 → 播放。不再产生中间 `.bin`。
+
 ## 2. 库接口（只有 4 个函数）
 
 ```c
