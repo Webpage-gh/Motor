@@ -210,11 +210,14 @@ def main():
     tmp = dst + ".tmp.wav"
     wavfile.write(tmp, SR, pcm)
     title = os.path.splitext(os.path.basename(src))[0] + " (lead extract)"
+    # 按输出后缀选编码：.flac/.wav 走无损（避免"提取后再压一次 mp3"），其余仍 320k
+    lossless = dst.lower().endswith((".flac", ".wav"))
+    codec = (["-c:a", "flac"] if lossless
+             else ["-b:a", "320k", "-ac", "2"])
     try:
         subprocess.check_call([
             "ffmpeg", "-y", "-v", "error", "-i",
-             tmp, "-b:a", "320k", "-ar", str(SR),
-             "-ac", "2", "-metadata",
+             tmp, *codec, "-ar", str(SR), "-metadata",
              "title=" + title, dst
         ])
     finally:
