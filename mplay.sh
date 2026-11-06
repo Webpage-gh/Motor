@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/sh
+#!/bin/sh
 # mplay —— 把音频文件直接送到马达上播放（ffmpeg 解码 → motor stdin）
 #
 # 用法:
@@ -32,6 +32,7 @@ MAG=${4:-}
 
 [ -n "$FILE" ] || usage
 [ -f "$FILE" ] || { echo "找不到文件: $FILE" >&2; exit 1; }
+[ -f "$MOTOR" ] || { echo "找不到 $MOTOR，请先编译"; exit 1; }
 
 # 切口 20ms 淡入/淡出：切段产生的陡边会被安全层当瞬态压掉（实测压到 56~68%）
 AF="afade=t=in:st=0:d=0.02"
