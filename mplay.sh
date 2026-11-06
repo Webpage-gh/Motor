@@ -4,7 +4,6 @@
 # 用法:
 #   mplay <文件> [起始秒] [时长秒] [mag]
 #   mplay --dry <文件> ...        只体检不振动（普通用户可跑）
-#   mplay --norm <文件> ...       量化前把峰值归一到 0.9（约 +6dB）
 set -u
 
 DIR=$(cd "$(dirname "$0")" && pwd)
@@ -20,7 +19,6 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry)  DRY=1; shift ;;
-        --norm*) FLAGS="$FLAGS $1"; shift ;;
         -h|--help) usage ;;
         --*) echo "未知选项: $1" >&2; usage ;;
         *) break ;;

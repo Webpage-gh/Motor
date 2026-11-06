@@ -48,7 +48,6 @@ static int g_safety = 1;      /* 1=自动安全检查（默认） */
 static int g_max_ms = 0;      /* 0=不截断（默认）；可 --max-ms 指定 */
 static int g_force = 0;       /* 1 = 绕过能量预算/时长上限（--force） */
 static int g_dry = 0;         /* 1 = 只体检不播放（--dry，用于 sweep/tone） */
-static double g_norm = 0.0;   /* --norm[=目标峰值比例]：量化前归一化（0=不归一） */
 
 /* ================= 安全层 =================
  * 规则全部来自实测，不含新东西：
@@ -657,7 +656,6 @@ static void usage(void)
         "  motor stop\n"
         "  motor stdin [mag]                管道读 f32le 单声道 24kHz 并播放\n"
         "  motor --dry ...                  只体检不播放（配合 sweep/stdin）\n"
-        "  motor --norm[=0.9] ...           量化前把峰值归一化（配 stdin）\n"
         "  motor --max-ms <N> ...           限制单次时长（0=不限，默认）\n"
         "  motor --no-safety ...            跳过安全检查\n"
         "  motor --force ...                绕过能量预算/时长上限（超剂量时用）\n");
@@ -687,11 +685,6 @@ static int cmd_stdin(int mag)
     }
     double pk = 0.0;
     for (size_t i = 0; i < n; i++) { double a = fabs(f[i]); if (a > pk) pk = a; }
-    double gain = 1.0;
-    if (g_norm > 0.0 && pk > 1e-9) {
-        gain = g_norm / pk;
-        if (gain > 64.0) gain = 64.0;              /* 静音输入保护 */
-    }
     signed char *b = malloc(n);
     if (!b) { free(f); fputs("内存不足\n", stderr); return 1; }
     unsigned int seed = 0x9e3779b9u;
@@ -700,15 +693,14 @@ static int cmd_stdin(int mag)
         double u1 = (seed >> 8) * (1.0 / 16777216.0);
         seed = seed * 1664525u + 1013904223u;
         double u2 = (seed >> 8) * (1.0 / 16777216.0);
-        double v = f[i] * gain * 127.0 + (u1 - u2);  /* ±1 LSB 三角抖动 */
+        double v = f[i] * 127.0 + (u1 - u2);  /* ±1 LSB 三角抖动 */
         if (v > 127.0) v = 127.0;
         if (v < -128.0) v = -128.0;
         b[i] = (signed char)lrint(v);
     }
     free(f);
-    printf("stdin %zu 样本 (%.2fs) 输入峰值 %.3f", n, (double)n / SR, pk);
-    if (gain != 1.0) printf(" → 归一化 ×%.2f (%+.1f dB)", gain, 20 * log10(gain));
-    printf("  mag=0x%04X (level %d)\n", mag, level_of(mag));
+    printf("stdin %zu 样本 (%.2fs) 输入峰值 %.3f  mag=0x%04X (level %d)\n",
+           n, (double)n / SR, pk, mag, level_of(mag));
     if (g_dry) { int r = motor_report("stdin", b, n, mag); free(b); return r; }
     if (motor_open() < 0) { free(b); return 1; }
     int r = motor_play(b, n, mag);
@@ -744,15 +736,10 @@ int main(int argc, char **argv)
             g_dry = 1;
             for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
             argc--;
-        } else if (!strncmp(argv[1], "--norm", 6) && (argv[1][6] == 0 || argv[1][6] == '=')) {
-            g_norm = 0.9;
-            if (argv[1][6] == '=') g_norm = atof(argv[1] + 7);
-            if (g_norm <= 0.0 || g_norm > 1.0) {
-                fputs("--norm 的目标必须在 (0,1] 内\n", stderr);
-                return 2;
-            }
-            for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
-            argc--;
+        } else if (!strcmp(argv[1], "--norm") || !strncmp(argv[1], "--norm=", 7)) {
+            fputs("--norm 已移除：纯峰值归一化不看频段，人声/宽频素材会把\n"
+                  "190-485Hz 自由区放大到危险振动。需要更响请调 mag 或分段。\n", stderr);
+            return 2;
         } else break;
     }
     const char *cmd = argc > 1 ? argv[1] : "";
