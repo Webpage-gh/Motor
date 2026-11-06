@@ -46,6 +46,24 @@ ffmpeg -v error -ss 30 -t 60 -i 歌.mp3 -af "afade=t=in:st=0:d=0.02,afade=t=out:
 `motor stdin` 自己做：降混已是 ffmpeg 完成 → **8bit 量化带 ±1 LSB 三角抖动**（比原来
 `int16→s8` 截断的噪声底干净）→ `--norm` 归一化 → 安全层 → 播放。不再产生中间 `.bin`。
 
+### 提取主旋律（原曲 → 单声部）
+
+```bash
+./tools/extract 原曲.mp3 lead.flac     # 输出后缀 .flac/.wav 无损，.mp3 走 320k
+./mplay.sh --dry lead.flac             # 体检
+./mplay.sh lead.flac 30 60             # 播放
+```
+
+`tools/extract` 是 `tools/extract_lead.py` 的 C 移植（同一算法：STFT 谐波软掩码 +
+原始相位 overlap-add，不合成、不改响度）。实测对拍：
+
+| 输入 | Python | C | 一致性 |
+|---|---|---|---|
+| 20s 切片 | 5.8 s | 2.1 s | 相关 1.000000，最大差 4e-5（1 个 int16 LSB），−98 dB |
+| 127s 全长 | ~25 s | **9.8 s** | 统计完全相同（77% 有音高、41~91 MIDI、峰值 0.8416） |
+
+依赖只有 `ffmpeg`（解码/编码）和 `-lm`，不需要 numpy/scipy。
+
 ## 2. 库接口（只有 4 个函数）
 
 ```c
