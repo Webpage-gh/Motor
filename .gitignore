@@ -1,3 +1,6 @@
 *.bak
+*.flac
+*.mp3
+*.m4a
 motor
 extract
