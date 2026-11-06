@@ -296,6 +296,11 @@ sysfs：`/sys/devices/platform/11d01000.i2c9/i2c-9/9-005a/`。
 - 长内容靠 `--max-ms` 切段，不支持"边放边算"的流式剂量；
 - 只有 8bit / 24kHz 一种 PCM 格式（芯片流式通路就是这个采样率）。
 
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。安全层的常数来自单台设备的实测，**不带任何担保**——
+把手机振坏、振到过热，责任在使用者。
+
 ## 目录结构
 
 ```
@@ -305,5 +310,6 @@ build.sh            编译 motor 与 extract
 src/extract.c     主旋律提取器（C，自写 4096 点 FFT）
 reference/extract_lead.py  提取器的 Python 参考实现（对拍基准，需要 numpy/scipy）
 reference/频率-振幅测试表.csv  我自己设备测出来的最大无异响振幅，motor.c内置安全机制参考
+LICENSE
 README.md
 ```
