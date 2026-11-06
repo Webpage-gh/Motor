@@ -3,7 +3,13 @@
  * 用法:
  *   motor tone <Hz> <ms> [peak] [mag]     内置正弦，直接放
  *   motor play <file.bin> [mag]           播放 8bit 有符号单声道 PCM（24kHz）
+ *   motor check <file.bin> [mag]          只做安全体检，不播放（不需 root）
+ *   motor sweep <f0> <f1> <ms> [peak] [mag] [lin]
+ *                                         扫频（默认对数，加 lin 线性）
+ *   motor stdin [mag]                     管道读 f32le 单声道 24kHz 并播放
  *   motor stop                            立即静音（紧急用，不做收尾）
+ *
+ * 前置选项（写在命令之前）：--dry --max-ms N --no-safety --force
  *
  * 库接口:
  *   int  motor_open(void);
@@ -27,7 +33,7 @@
 #define SYS     "/sys/devices/platform/11d01000.i2c9/i2c-9/9-005a"
 #define CW_ID   197      /* CUSTOME_WAVE_ID：写进 custom_data[0] 才会进流式通路 */
 #define PERIOD  512      /* 芯片每次取走的字节数 */
-#define MAXBUF  8192     /* 环形缓冲大小 */
+#define MAXBUF  8192     /* custom_wave 的 max_size：free_size 回到它才算播完 */
 #define SR      24000    /* 采样率（实测 ≈24kB/s） */
 
 #ifndef FF_CUSTOM
@@ -50,14 +56,16 @@ static int g_force = 0;       /* 1 = 绕过能量预算/时长上限（--force�
 static int g_dry = 0;         /* 1 = 只体检不播放（--dry，用于 sweep/tone） */
 
 /* ================= 安全层 =================
- * 规则全部来自实测，不含新东西：
- *  1) 共振带安全峰值表（mag=0x7FFF / level=128 时测得）
- *  2) 档位放宽：低档位按 ×128/level 线性放宽
- *  3) 带内再乘 0.8 余量（带外不乘，否则误伤厂商素材）
- *  4) 持续音 RMS ≤ 15
- *  5) 瞬态：每样本跳变 ≤ max(40, 局部 RMS)（满幅 click 127 → 40）
- *  6) 时长：默认不截断，超过 10s 且 RMS>10 只提示；--max-ms N 真截断并清零尾巴
- *  7) 已知缺口：不检测 DC 偏置，也不管 >581Hz 的声学共振
+ * 规则全部来自实测，不含新东西，按执行顺序：
+ *  1) 时长截断：--max-ms N 真截断并清零尾巴（默认不截断）
+ *  2) 25Hz 二级高通：去直流与 <40Hz（常数 DC 输入会被压到 0）
+ *  3) 共振带安全峰值表（mag=0x7FFF / level=128 时测得），逐块扫描 + 块间平滑施加
+ *  4) 档位放宽：低档位按 ×128/level 线性放宽
+ *  5) 带内余量按带分开：152–190 ×HEAD_B1(0.03)、485–581 ×HEAD_B2(1.00)，带外不乘
+ *  6) 分块 RMS：带内 ≤ 15；带外 ≤ 90（带外不用 15 压，否则误伤厂商素材）
+ *  7) 能量预算/时长：剂量 > 121500 或时长 > 300s → 事前拒绝（退出码 3）
+ *  8) 瞬态：每样本跳变 ≤ max(40, 3×前视局部 RMS)（满幅 click 127 → 40）
+ *  9) 已知缺口：不管 >581Hz 的声学共振；长时播放只提示发热
  */
 typedef struct { int f, pk; } SafePt;
 static const SafePt SAFE[] = {
@@ -147,7 +155,7 @@ static signed char clip127(double v)
     return (signed char)lrint(v);
 }
 
-/* 一阶高通（20Hz）：去掉直流与 <40Hz 分量。
+/* 25Hz 二级高通：去掉直流与 <40Hz 分量。
  * 实测表：40Hz 满幅安全，更低会从"微弱"变成"敲手机"；直流是最极端的情况 */
 static int hpf_apply(signed char *pcm, size_t n)
 {
@@ -183,7 +191,7 @@ static size_t rep_add(char *msg, size_t cap, size_t used, const char *fmt, ...)
 /* ---- 瞬态限幅（治"撞壳"的 click） ----
  * 纯正弦的每样本最大跳变 ≈ 2πf/SR × peak：2.4kHz 满幅也只有 0.62×RMS；
  * 静音里单个满幅样本的跳变却是 127，宽频瞬态远超正弦。故：
- *   允许步长 = max(SLEW_MIN, 前视 64 样本的局部 RMS)
+ *   允许步长 = max(SLEW_MIN, 3× 前视 64 样本的局部 RMS)
  * 需要的增益先做 ±16 样本最小值腐蚀（提前下压），再 32 点盒式平滑（不造新陡边）。
  * 返回最小增益（1.0 = 未处理）；**返回 -1 = 内存不足，调用方必须拒绝播放**。
  */
@@ -270,7 +278,8 @@ static double transient_guard(signed char *pcm, size_t n, int *maxj_out)
     return ming;
 }
 
-/* 就地安全处理：分块测共振带 → 限 RMS → 限瞬态 → 时长截断。
+/* 就地安全处理，顺序：时长截断 → 25Hz 高通 → 分块共振带 → 分块 RMS
+ * → 能量预算拒绝 → 瞬态限幅。
  * *np 传入长度、回写生效长度；返回 1 = 有改动 */
 static int motor_sanitize(signed char *pcm, size_t *np, int mag, char *rep, size_t replen)
 {
@@ -517,7 +526,7 @@ int motor_play(const signed char *pcm, size_t n, int mag)
 {
     signed char *buf = NULL;
     if (g_safety) {
-        /* 安全检查：共振带 → RMS → 瞬态 → 时长截断；返回值是生效长度 */
+        /* 安全检查（截断→高通→共振带→RMS→剂量→瞬态）；n 会被改写为生效长度 */
         size_t cap = n;
         buf = malloc(cap ? cap : 1);
         if (!buf) return -1;

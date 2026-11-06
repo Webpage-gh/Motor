@@ -397,7 +397,7 @@ int main(int argc, char **argv)
     }
     free(S); free(top); free(conf); free(sharp); free(energy); free(midi);
 
-    /* --- 掩码（不落全矩阵，逐帧生成，时间方向 3 点平滑用前后帧） --- */
+    /* --- 掩码：逐帧按谐波写 M[T][F]，再沿时间做 3 点平滑（因此存两份，各 T×F） --- */
     float *M = xmalloc(sizeof(float) * (size_t)T * F);
     {
         float *row = xmalloc(sizeof(float) * F);

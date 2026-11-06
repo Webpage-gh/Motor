@@ -12,7 +12,7 @@ DRY=0
 FLAGS=""
 
 usage() {
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
