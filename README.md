@@ -4,12 +4,6 @@
 一个 C 文件，一条编译命令，能直接把任意 8bit PCM 喂给马达；内置一层基于实测的安全层，
 把"会撞壳/会发热"的内容挡住。
 
-```bash
-./build.sh                                    # 产出 ./motor 和 ./tools/extract
-su -c './motor tone 600 1000 60'              # 600Hz 响 1 秒
-./mplay.sh 歌.mp3 30 10                       # 放 30s 起的 10 秒
-```
-
 > **仅限自担风险自用。** 这层安全措施来自单台设备的实测，不是厂商规格；
 > 它能让"听起来像耳机"的素材安全播放，但**不能保证任何素材都不损伤马达**。
 
@@ -18,8 +12,7 @@ su -c './motor tone 600 1000 60'              # 600Hz 响 1 秒
 ## 目录
 
 - [能做什么](#能做什么)
-- [安装](#安装)
-- [放音乐：完整链路](#放音乐完整链路)
+- [如何使用](#如何使用)
 - [命令参考](#命令参考)
 - [安全层](#安全层)
 - [音量 `mag` → 驱动 `level`](#音量-mag--驱动-level)
@@ -37,68 +30,73 @@ su -c './motor tone 600 1000 60'              # 600Hz 响 1 秒
 
 | 内容 | 效果 |
 |---|---|
-| 单声部纯音 / 主旋律 | 能听出旋律（`152–1200Hz` 最有效） |
+| 单声部纯音 / 主旋律 | 能听出旋律（`支持40–11700Hz`） |
 | 低频包络 | 能摸到节奏 |
 | 瞬态 | 鼓点，但连续瞬态会被安全层压 |
 
 多声部/宽频带原曲直接播放只会变成"坏掉的手机"。本仓库因此包含两步：
 
 ```
-原曲.mp3 ──tools/extract──> lead.flac ──mplay.sh──> 马达
+原曲.mp3 ──extract──> lead.flac ──mplay.sh──> 马达
           （多声部→单声部）              （解码+量化+安全层+播放）
 ```
 
-## 安装
+## 如何使用
 
 要求：Termux、`clang`、`ffmpeg`、**root**（`su` 可用于访问 `/dev/input/event2`）。
 
+### 1. 编译
 ```bash
 pkg install clang ffmpeg
 git clone <this repo> ~/motor && cd ~/motor
 ./build.sh
 ```
 
-- `motor check` / `motor --dry` **不需要 root**（只体检不振动）。
-- `motor play` / `tone` / `sweep` / `stdin` / `stop` 需要 root：
-  Termux 里 `su -c` 是 `/system/bin/sh`，**不展开 `~`**，路径要写全
-  （`/data/data/com.termux/files/home/motor/motor`）。
-- `tools/extract_lead.py` 是 C 提取器的参考实现，只在做对拍时需要
-  `python3 + numpy + scipy`；日常使用不需要。
+做的事：编译src目录下的extract.c和motor.c到项目根目录。
 
-## 放音乐：完整链路
+### 2. 做扫频测试
+```bash
+# <f0> <f1> <ms> [peak]
+su -c ./motor sweep 40 11700 10000 30
+```
 
-### 1. 提取主旋律（每首歌跑一次，离线）
+确认无共振异响后，可以逐渐提高peak，不指定peak则为最大值100。
+
+### 3. 提取主旋律（无需Root）
 
 ```bash
-./tools/extract 原曲.mp3 lead.flac     # 输出 .flac/.wav 走无损，.mp3 走 320k
+./extract 原曲.mp3 lead.flac     # 输出 .flac/.wav 走无损，.mp3 走 320k
 ```
 
 做的事：STFT 上按估计的 f0 做**谐波软掩码**，用**原始相位** overlap-add 重建。
 不重新发声、不改音色/响度/包络/时间轴/声道，只保留"主旋律所在的那几条谱线"。
 
-### 2. 体检（不振动，普通用户可跑）
+### 4. 检测主旋律（可选，无需Root）
 
 ```bash
 ./mplay.sh --dry lead.flac 30 10       # 只看报告
 ```
 
-### 3. 播放
+### 5. 播放（需Root，必须先做扫频测试）
 
 ```bash
-./mplay.sh lead.flac                   # 从头放
-./mplay.sh lead.flac 30 60             # 30s 起放 60 秒
-./mplay.sh lead.flac 30 60 0x5FFF      # 再加音量档（这里是 50%）
+# 从头放
+./mplay.sh lead.flac
+# 30s 起放 60 秒
+./mplay.sh lead.flac 30 60
+# 再加上调整音量（相对于满音量 0x7FFF 的 50%）
+./mplay.sh lead.flac 30 60 0x5FFF
 ```
 
-`mplay.sh` = `ffmpeg` 解码 → `motor stdin`：
+`mplay.sh` 做的核心工作如下：
 
 ```bash
 ffmpeg -v error -ss 30 -t 60 -i lead.flac \
        -af "afade=t=in:st=0:d=0.02,afade=t=out:st=59.98:d=0.02" \
-       -f f32le -ac 1 -ar 24000 - | su -c 'motor/motor stdin'
+       -f f32le -ac 1 -ar 24000 - | su -c "$PWD/motor stdin"
 ```
 
-- `ffmpeg` 用普通用户跑，只有 `motor` 那一段需要 root；
+- `ffmpeg` 用普通用户跑，只有 `motor` 那一段需要 root，脚本自动使用 su 执行这一部分；
 - 8bit 量化带 **±1 LSB 三角抖动**（抖动量化为白噪声，不是截断）；
 - 不做归一化、不做压缩，**源文件多响就多响**；
 - 切口自动加 20ms 淡入淡出，避免切口陡边被瞬态规则误伤。
@@ -115,7 +113,7 @@ ffmpeg -v error -ss 30 -t 60 -i lead.flac \
 
 ```bash
 motor tone <Hz> <ms> [peak] [mag]        内置正弦（默认 peak 60，20ms 起落）
-motor play <file.bin> [mag]              播放 8bit 有符号单声道 24kHz PCM
+motor play <file.bin> [mag]              播放 8bit 有符号单声道 24kHz PCM，普通音频很容易炸
 motor check <file.bin> [mag]             只做安全体检（不需 root）
 motor sweep <f0> <f1> <ms> [peak] [mag] [lin]
                                          扫频，默认对数；加 lin 为线性
@@ -180,13 +178,15 @@ mplay.sh --dry <文件> ...
 | 300 Hz | 127 | 100%（带外，自由区） |
 | 600 Hz | 127 | 100%（带外） |
 
+原始记录见 `reference/频率-振幅测试表.csv`（27 行，与代码里 `SAFE[]` 的 25 个点逐一对应）。
+
 `HEAD_B1=0.03` 会让 152–190Hz 再降到 ~1%（只剩"敲壳"尖峰被按掉）；
 `HEAD_B2=1.00` 表示 485–581Hz 直接用表值，不额外打折。
 两段都是编译期常量，可做对比实验：
 
 ```bash
-clang -O2 -DHEAD_B1=0.25 -o motor motor.c -lm    # 中间档
-clang -O2 -DHEAD_B1=0.8 -DHEAD_B2=0.8 -o motor motor.c -lm  # 早期行为
+clang -O2 -DHEAD_B1=0.25 -o motor src/motor.c -lm    # 中间档
+clang -O2 -DHEAD_B1=0.8 -DHEAD_B2=0.8 -o motor src/motor.c -lm  # 早期行为
 ```
 
 **响度天花板在共振带，不在 `mag`。** 实测主旋律素材（10s，满档）：
@@ -292,17 +292,18 @@ sysfs：`/sys/devices/platform/11d01000.i2c9/i2c-9/9-005a/`。
 
 - **只管 152–581Hz 两个共振带**；>581Hz 靠机身声学共振发声（2.4kHz 最响），安全层不建模；
 - **发热由能量预算控制**，不测温度：长时间播放只给提示，不强制中断；
-- **不检测多声部**：原曲必须先用 `tools/extract` 提取，否则就是宽频激励；
+- **不检测多声部**：原曲必须先用 `extract` 提取，否则就是宽频激励；
 - 长内容靠 `--max-ms` 切段，不支持"边放边算"的流式剂量；
 - 只有 8bit / 24kHz 一种 PCM 格式（芯片流式通路就是这个采样率）。
 
 ## 目录结构
 
 ```
-motor.c             播放库 + 安全层 + CLI
+src/motor.c         播放库 + 安全层 + CLI
 mplay.sh            ffmpeg → motor stdin 的一行式封装
-build.sh            编译 motor 与 tools/extract
-tools/extract.c     主旋律提取器（C，自写 4096 点 FFT）
-tools/extract_lead.py  提取器的 Python 参考实现（对拍基准，需要 numpy/scipy）
+build.sh            编译 motor 与 extract
+src/extract.c     主旋律提取器（C，自写 4096 点 FFT）
+reference/extract_lead.py  提取器的 Python 参考实现（对拍基准，需要 numpy/scipy）
+reference/频率-振幅测试表.csv  我自己设备测出来的最大无异响振幅，motor.c内置安全机制参考
 README.md
 ```
